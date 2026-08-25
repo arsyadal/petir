@@ -1,6 +1,7 @@
 pub mod cell;
 pub mod grid;
 
+use crate::image::{self, DecodedImage};
 use cell::{CellFlags, Rgb};
 use grid::Grid;
 use vte::{Params, Parser, Perform};
@@ -25,6 +26,11 @@ const PALETTE: [Rgb; 16] = [
     Rgb::new(0xea, 0xea, 0xea), // bright white
 ];
 
+/// Which DCS payload is currently being buffered via `Perform::hook/put`.
+enum DcsKind {
+    Sixel,
+}
+
 pub struct Term {
     pub grid: Grid,
     parser: Parser,
@@ -34,6 +40,12 @@ pub struct Term {
     pub title: Option<String>,
     /// Bell requested (BEL char) — UI can flash the tab or play a sound.
     pub bell: bool,
+    /// Images decoded from Sixel/Kitty escape sequences, in arrival order.
+    /// Not yet drawn by the renderer (textured-quad upload is a follow-up) —
+    /// this is just the decode-and-collect half of the pipeline.
+    pub images: Vec<DecodedImage>,
+    dcs_kind: Option<DcsKind>,
+    dcs_buf: Vec<u8>,
 }
 
 impl Term {
@@ -47,6 +59,9 @@ impl Term {
             default_bg,
             title: None,
             bell: false,
+            images: Vec::new(),
+            dcs_kind: None,
+            dcs_buf: Vec::new(),
         }
     }
 
@@ -55,9 +70,38 @@ impl Term {
     }
 
     /// Feed raw bytes read from the PTY into the VT100/ANSI state machine.
+    ///
+    /// Kitty graphics (APC `ESC _ G ... ST`) is intercepted here rather than
+    /// through `vte::Perform`: this vte version's state machine silently
+    /// discards APC string content (no callback exists for it), so we pull
+    /// the sequence out of the raw stream ourselves before it ever reaches
+    /// the parser. Everything else still goes through `parser_advance`
+    /// byte-by-byte as before.
     pub fn advance(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.parser_advance(byte);
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'_') && bytes.get(i + 2) == Some(&b'G') {
+                if let Some(st_offset) = find_st(&bytes[i..]) {
+                    let payload = &bytes[i + 3..i + st_offset];
+                    self.handle_kitty_apc(payload);
+                    i += st_offset + 2; // skip past the ST (ESC \)
+                    continue;
+                }
+                // ST not in this chunk yet (rare: split across PTY reads).
+                // Fall through to normal per-byte feed; vte will just
+                // silently ignore it and we miss this one image.
+            }
+            self.parser_advance(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn handle_kitty_apc(&mut self, payload: &[u8]) {
+        let Ok(s) = std::str::from_utf8(payload) else { return };
+        let (control, data) = s.split_once(';').unwrap_or((s, ""));
+        match image::decode_kitty(control, data, self.grid.cursor.col, self.grid.cursor.row) {
+            Ok(img) => self.images.push(img),
+            Err(e) => log::warn!("gagal decode gambar Kitty: {e}"),
         }
     }
 
@@ -69,6 +113,14 @@ impl Term {
         parser.advance(&mut performer, byte);
         self.parser = parser;
     }
+}
+
+/// Find the offset of the first `ESC \` (String Terminator) in `data`,
+/// relative to the start of `data`. Only the 7-bit two-byte form is
+/// recognized — real-world senders (kitty's own `icat`, etc.) always emit
+/// this form rather than the 8-bit C1 `0x9c`.
+fn find_st(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|w| w[0] == 0x1b && w[1] == b'\\')
 }
 
 struct TermPerformer<'a> {
@@ -127,6 +179,32 @@ impl<'a> Perform for TermPerformer<'a> {
             'm' => self.sgr(params),
             _ => {}
         }
+    }
+
+    /// DCS introducer. Sixel graphics arrive as `ESC P ... q <data> ESC \`
+    /// — the final action character of the DCS header is `q`; everything
+    /// else (device attribute requests, etc.) we don't handle, so it's
+    /// dropped rather than buffered.
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        self.term.dcs_buf.clear();
+        self.term.dcs_kind = if action == 'q' { Some(DcsKind::Sixel) } else { None };
+    }
+
+    fn put(&mut self, byte: u8) {
+        if self.term.dcs_kind.is_some() {
+            self.term.dcs_buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(DcsKind::Sixel) = self.term.dcs_kind.take() {
+            let (col, row) = (self.term.grid.cursor.col, self.term.grid.cursor.row);
+            match image::decode_sixel(&self.term.dcs_buf, col, row) {
+                Ok(img) => self.term.images.push(img),
+                Err(e) => log::warn!("gagal decode gambar Sixel: {e}"),
+            }
+        }
+        self.term.dcs_buf.clear();
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {

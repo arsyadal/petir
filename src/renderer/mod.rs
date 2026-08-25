@@ -1,6 +1,7 @@
 pub mod quad;
 
 use crate::pane::Layout;
+use crate::search::SearchState;
 use crate::term::cell::CellFlags;
 use crate::term::grid::Grid;
 use glyphon::{
@@ -10,6 +11,9 @@ use glyphon::{
 use quad::{QuadInstance, QuadRenderer};
 use std::sync::Arc;
 use winit::window::Window;
+
+const SEARCH_BOX_W: f32 = 340.0;
+const SEARCH_BOX_H: f32 = 30.0;
 
 pub struct GpuState {
     pub surface: wgpu::Surface<'static>,
@@ -143,6 +147,7 @@ impl GpuState {
         panes: &[(&Grid, [f32; 4], bool)],
         padding: (f32, f32),
         ligatures: bool,
+        search: Option<(&SearchState, usize)>,
     ) -> anyhow::Result<()> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -160,9 +165,20 @@ impl GpuState {
             }
         }
 
+        // --- Search match highlights + search box chrome, active pane only ---
+        let search_box = if let Some((state, scrollback_len)) = search {
+            let active_rect = panes.iter().find(|(_, _, is_active)| *is_active).map(|(_, r, _)| *r);
+            if let Some(rect) = active_rect {
+                self.push_search_match_instances(state, scrollback_len, rect, padding, &mut instances);
+            }
+            Some(self.push_search_box_instances(state, &mut instances))
+        } else {
+            None
+        };
+
         // --- Text buffers, one per pane, built fresh each frame ---
         let shaping = if ligatures { Shaping::Advanced } else { Shaping::Basic };
-        let mut buffers: Vec<TextBuffer> = Vec::with_capacity(panes.len());
+        let mut buffers: Vec<TextBuffer> = Vec::with_capacity(panes.len() + 1);
         for (grid, rect, _) in panes {
             let mut buf = TextBuffer::new(&mut self.font_system, Metrics::new(self.font_size, self.cell_h));
             buf.set_size(&mut self.font_system, rect[2], rect[3]);
@@ -171,8 +187,15 @@ impl GpuState {
             buf.shape_until_scroll(&mut self.font_system);
             buffers.push(buf);
         }
+        if let Some((_, _, label)) = &search_box {
+            let mut buf = TextBuffer::new(&mut self.font_system, Metrics::new(self.font_size, self.cell_h));
+            buf.set_size(&mut self.font_system, SEARCH_BOX_W, SEARCH_BOX_H);
+            buf.set_text(&mut self.font_system, label, Attrs::new().family(Family::Monospace), Shaping::Basic);
+            buf.shape_until_scroll(&mut self.font_system);
+            buffers.push(buf);
+        }
 
-        let text_areas: Vec<TextArea> = panes
+        let mut text_areas: Vec<TextArea> = panes
             .iter()
             .zip(buffers.iter())
             .map(|((_, rect, _), buf)| TextArea {
@@ -189,6 +212,21 @@ impl GpuState {
                 default_color: GlyphonColor::rgb(0xd8, 0xd8, 0xd8),
             })
             .collect();
+        if let Some((x, y, _)) = search_box {
+            text_areas.push(TextArea {
+                buffer: buffers.last().unwrap(),
+                left: x + 8.0,
+                top: y + 6.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: x as i32,
+                    top: y as i32,
+                    right: (x + SEARCH_BOX_W) as i32,
+                    bottom: (y + SEARCH_BOX_H) as i32,
+                },
+                default_color: GlyphonColor::rgb(0xff, 0xff, 0xff),
+            });
+        }
 
         let resolution = Resolution { width: self.config.width, height: self.config.height };
         self.text_renderer.prepare(
@@ -257,6 +295,69 @@ impl GpuState {
                 });
             }
         }
+    }
+
+    /// Highlight rects for scrollback-search matches on the active pane.
+    /// Only matches that fall within the visible viewport can be drawn —
+    /// scrollback itself has no rendering path yet (see README), so matches
+    /// with `row < scrollback_len` are silently skipped for now.
+    fn push_search_match_instances(
+        &self,
+        state: &SearchState,
+        scrollback_len: usize,
+        rect: [f32; 4],
+        padding: (f32, f32),
+        out: &mut Vec<QuadInstance>,
+    ) {
+        if state.query.is_empty() {
+            return;
+        }
+        for (i, m) in state.matches.iter().enumerate() {
+            if m.row < scrollback_len {
+                continue;
+            }
+            let visible_row = m.row - scrollback_len;
+            let color = if i == state.current {
+                [1.0, 0.55, 0.0, 0.55] // current match: brighter orange
+            } else {
+                [1.0, 0.85, 0.2, 0.35] // other matches: dim yellow
+            };
+            let width = m.col_end.saturating_sub(m.col_start).max(1) as f32 * self.cell_w;
+            out.push(QuadInstance {
+                pos: [
+                    rect[0] + padding.0 + m.col_start as f32 * self.cell_w,
+                    rect[1] + padding.1 + visible_row as f32 * self.cell_h,
+                ],
+                size: [width, self.cell_h],
+                color,
+            });
+        }
+    }
+
+    /// Border + background chrome for the search box (top-right corner of
+    /// the window). Returns its (x, y, label-text) so the caller can lay out
+    /// a matching glyphon text area on top.
+    fn push_search_box_instances(&self, state: &SearchState, out: &mut Vec<QuadInstance>) -> (f32, f32, String) {
+        let x = self.config.width as f32 - SEARCH_BOX_W - 12.0;
+        let y = 12.0;
+        out.push(QuadInstance {
+            pos: [x - 1.5, y - 1.5],
+            size: [SEARCH_BOX_W + 3.0, SEARCH_BOX_H + 3.0],
+            color: [1.0, 0.55, 0.0, 0.9],
+        });
+        out.push(QuadInstance {
+            pos: [x, y],
+            size: [SEARCH_BOX_W, SEARCH_BOX_H],
+            color: [0.08, 0.08, 0.08, 0.95],
+        });
+        let label = if state.query.is_empty() {
+            "Search: (type to search)".to_string()
+        } else if state.matches.is_empty() {
+            format!("Search: {}  no matches", state.query)
+        } else {
+            format!("Search: {}  {}/{}", state.query, state.current + 1, state.matches.len())
+        };
+        (x, y, label)
     }
 
     fn push_cursor_instance(&self, grid: &Grid, rect: [f32; 4], padding: (f32, f32), out: &mut Vec<QuadInstance>) {

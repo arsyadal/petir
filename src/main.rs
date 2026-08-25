@@ -155,7 +155,17 @@ impl App {
             .map(|(idx, rect)| (&tab.panes[*idx].term.grid, *rect, *idx == tab.active_pane))
             .collect();
 
-        if let Err(e) = self.gpu.render_frame(&panes, pad, self.config.font.ligatures) {
+        let search_overlay = if self.search_active {
+            let scrollback_len = tab.panes[tab.active_pane].term.grid.scrollback.len();
+            Some((&self.search, scrollback_len))
+        } else {
+            None
+        };
+
+        if let Err(e) = self
+            .gpu
+            .render_frame(&panes, pad, self.config.font.ligatures, search_overlay)
+        {
             log::warn!("render error: {e}");
         }
     }
@@ -221,6 +231,9 @@ impl App {
                 }
                 Key::Character(s) if s.as_str() == "F" || s.as_str() == "f" => {
                     self.search_active = !self.search_active;
+                    if self.search_active {
+                        self.rerun_search();
+                    }
                     return;
                 }
                 Key::Character(s) if s.as_str() == "C" || s.as_str() == "c" => {
@@ -279,6 +292,32 @@ impl App {
             }
         }
 
+        // --- Search box input (consumes keys instead of forwarding to the
+        // shell while the search overlay is open) ---
+        if self.search_active {
+            match &event.logical_key {
+                Key::Named(NamedKey::Backspace) => {
+                    self.search.query.pop();
+                    self.rerun_search();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if shift {
+                        self.search.prev_match();
+                    } else {
+                        self.search.next_match();
+                    }
+                    return;
+                }
+                Key::Character(s) => {
+                    self.search.query.push_str(s.as_str());
+                    self.rerun_search();
+                    return;
+                }
+                _ => return, // swallow everything else (e.g. arrows) while search is focused
+            }
+        }
+
         // --- Ordinary input forwarded to the shell ---
         let bytes = key_to_bytes(&event);
         if !bytes.is_empty() {
@@ -301,6 +340,13 @@ impl App {
     fn send_bytes(&mut self, bytes: &[u8]) {
         let pane = self.tabs.active_tab_mut().active_pane_mut();
         let _ = pane.pty.write_input(bytes);
+    }
+
+    /// Re-run scrollback search against the active pane's grid, e.g. after
+    /// the query changes or the search box is (re-)opened.
+    fn rerun_search(&mut self) {
+        let pane = self.tabs.active_tab_mut().active_pane_mut();
+        self.search.run(&pane.term.grid);
     }
 }
 
