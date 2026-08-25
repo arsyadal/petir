@@ -1,0 +1,66 @@
+[package]
+name = "petir"
+version = "0.1.0"
+edition = "2021"
+description = "Petir - terminal emulator ringan & super cepat untuk Windows (GPU-accelerated, ConPTY)"
+authors = ["cads"]
+license = "MIT"
+
+[[bin]]
+name = "petir"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+# Windowing / input
+winit = "0.29"
+raw-window-handle = "0.6"
+
+# GPU rendering
+wgpu = "0.19"
+glyphon = "0.5"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+
+# PTY (uses ConPTY automatically on Windows, forkpty on Unix)
+portable-pty = "0.8"
+
+# ANSI / VT100 escape sequence parser (same crate Alacritty uses)
+vte = "0.13"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+# Clipboard
+arboard = "3"
+
+# Misc
+log = "0.4"
+env_logger = "0.11"
+unicode-width = "0.1"
+anyhow = "1"
+crossbeam-channel = "0.5"
+notify = "6"
+bitflags = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png", "ico"]

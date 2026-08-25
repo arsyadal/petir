@@ -1,0 +1,7 @@
+/target
+*.pdb
+*.exe
+.vs/
+*.rs.bk
+Cargo.lock.bak
+.claude/

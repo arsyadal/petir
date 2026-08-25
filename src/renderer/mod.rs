@@ -1,0 +1,293 @@
+pub mod quad;
+
+use crate::pane::Layout;
+use crate::term::cell::CellFlags;
+use crate::term::grid::Grid;
+use glyphon::{
+    Attrs, Buffer as TextBuffer, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution,
+    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
+};
+use quad::{QuadInstance, QuadRenderer};
+use std::sync::Arc;
+use winit::window::Window;
+
+pub struct GpuState {
+    pub surface: wgpu::Surface<'static>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub config: wgpu::SurfaceConfiguration,
+    pub size: winit::dpi::PhysicalSize<u32>,
+
+    quad_renderer: QuadRenderer,
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    text_renderer: TextRenderer,
+
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub font_size: f32,
+}
+
+impl GpuState {
+    pub async fn new(window: Arc<Window>, font_size: f32) -> anyhow::Result<Self> {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            // DX12 first on Windows: lower driver overhead than the GL/Vulkan
+            // fallback path for most users, which is the whole point of
+            // targeting wgpu instead of raw OpenGL like Alacritty does.
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let surface = instance.create_surface(window.clone())?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("tidak ada GPU adapter yang cocok ditemukan"))?;
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("rterm-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                },
+                None,
+            )
+            .await?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoNoVsync, // lowest latency; Mailbox/Fifo via config later
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 1, // minimize input-to-photon latency
+        };
+        surface.configure(&device, &config);
+
+        let quad_renderer = QuadRenderer::new(&device, format);
+
+        let mut font_system = FontSystem::new();
+        let swash_cache = SwashCache::new();
+        let mut atlas = TextAtlas::new(&device, &queue, format);
+        let text_renderer = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+
+        // Measure monospace cell size from the shaped 'M' advance so the
+        // grid lines up with actual glyph metrics instead of a guess.
+        let metrics = Metrics::new(font_size, font_size * 1.2);
+        let mut probe = TextBuffer::new(&mut font_system, metrics);
+        probe.set_size(&mut font_system, 200.0, 200.0);
+        probe.set_text(&mut font_system, "M", Attrs::new().family(Family::Monospace), Shaping::Advanced);
+        probe.shape_until_scroll(&mut font_system);
+        let cell_w = probe
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first())
+            .map(|g| g.w)
+            .unwrap_or(font_size * 0.6);
+        let cell_h = font_size * 1.2;
+
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            quad_renderer,
+            font_system,
+            swash_cache,
+            atlas,
+            text_renderer,
+            cell_w,
+            cell_h,
+            font_size,
+        })
+    }
+
+    pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        self.size = size;
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    pub fn cols_rows_for(&self, px_w: f32, px_h: f32) -> (u16, u16) {
+        let cols = (px_w / self.cell_w).floor().max(1.0) as u16;
+        let rows = (px_h / self.cell_h).floor().max(1.0) as u16;
+        (cols, rows)
+    }
+
+    /// Render every pane in `layout` inside its rect, plus tab bar chrome.
+    /// `panes` is a slice of (grid, rect_px, is_active) tuples pre-resolved
+    /// by the caller from the split-tree layout.
+    pub fn render_frame(
+        &mut self,
+        panes: &[(&Grid, [f32; 4], bool)],
+        padding: (f32, f32),
+        ligatures: bool,
+    ) -> anyhow::Result<()> {
+        let output = self.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+
+        // --- Background quads (cell bg + cursor + selection) ---
+        let mut instances: Vec<QuadInstance> = Vec::new();
+        for (grid, rect, is_active) in panes {
+            self.push_bg_instances(grid, *rect, padding, &mut instances);
+            if *is_active && grid.cursor_visible {
+                self.push_cursor_instance(grid, *rect, padding, &mut instances);
+            }
+        }
+
+        // --- Text buffers, one per pane, built fresh each frame ---
+        let shaping = if ligatures { Shaping::Advanced } else { Shaping::Basic };
+        let mut buffers: Vec<TextBuffer> = Vec::with_capacity(panes.len());
+        for (grid, rect, _) in panes {
+            let mut buf = TextBuffer::new(&mut self.font_system, Metrics::new(self.font_size, self.cell_h));
+            buf.set_size(&mut self.font_system, rect[2], rect[3]);
+            let text = grid_to_text(grid);
+            buf.set_text(&mut self.font_system, &text, Attrs::new().family(Family::Monospace), shaping);
+            buf.shape_until_scroll(&mut self.font_system);
+            buffers.push(buf);
+        }
+
+        let text_areas: Vec<TextArea> = panes
+            .iter()
+            .zip(buffers.iter())
+            .map(|((_, rect, _), buf)| TextArea {
+                buffer: buf,
+                left: rect[0] + padding.0,
+                top: rect[1] + padding.1,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: rect[0] as i32,
+                    top: rect[1] as i32,
+                    right: (rect[0] + rect[2]) as i32,
+                    bottom: (rect[1] + rect[3]) as i32,
+                },
+                default_color: GlyphonColor::rgb(0xd8, 0xd8, 0xd8),
+            })
+            .collect();
+
+        let resolution = Resolution { width: self.config.width, height: self.config.height };
+        self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            resolution,
+            text_areas,
+            &mut self.swash_cache,
+        )?;
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.117, g: 0.117, b: 0.117, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            self.quad_renderer.render(
+                &self.device,
+                &self.queue,
+                &mut pass,
+                self.config.width as f32,
+                self.config.height as f32,
+                &instances,
+            );
+
+            self.text_renderer.render(&self.atlas, &mut pass)?;
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        output.present();
+        self.atlas.trim();
+        Ok(())
+    }
+
+    fn push_bg_instances(&self, grid: &Grid, rect: [f32; 4], padding: (f32, f32), out: &mut Vec<QuadInstance>) {
+        for (row_idx, row) in grid.visible.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                if cell.bg == grid.bg && !cell.flags.contains(CellFlags::INVERSE) {
+                    continue; // skip default-bg cells; the pane clear color already covers them
+                }
+                let (fg, bg) = if cell.flags.contains(CellFlags::INVERSE) {
+                    (cell.bg, cell.fg)
+                } else {
+                    (cell.fg, cell.bg)
+                };
+                let _ = fg;
+                out.push(QuadInstance {
+                    pos: [
+                        rect[0] + padding.0 + col_idx as f32 * self.cell_w,
+                        rect[1] + padding.1 + row_idx as f32 * self.cell_h,
+                    ],
+                    size: [self.cell_w, self.cell_h],
+                    color: bg.to_wgpu(),
+                });
+            }
+        }
+    }
+
+    fn push_cursor_instance(&self, grid: &Grid, rect: [f32; 4], padding: (f32, f32), out: &mut Vec<QuadInstance>) {
+        out.push(QuadInstance {
+            pos: [
+                rect[0] + padding.0 + grid.cursor.col as f32 * self.cell_w,
+                rect[1] + padding.1 + grid.cursor.row as f32 * self.cell_h,
+            ],
+            size: [self.cell_w * 0.15, self.cell_h], // thin I-beam bar; block/underline are config follow-ups
+            color: [1.0, 1.0, 1.0, 0.9],
+        });
+    }
+}
+
+fn grid_to_text(grid: &Grid) -> String {
+    let mut out = String::with_capacity(grid.cols * grid.rows + grid.rows);
+    for (i, row) in grid.visible.iter().enumerate() {
+        for cell in row {
+            out.push(cell.c);
+        }
+        if i + 1 != grid.visible.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Flatten a tab's split-tree layout into (pane_index, pixel_rect) pairs,
+/// used both for rendering and for hit-testing mouse clicks against panes.
+pub fn flatten_layout(layout: &Layout, x: f32, y: f32, w: f32, h: f32) -> Vec<(usize, [f32; 4])> {
+    let mut out = Vec::new();
+    layout.compute_rects(x, y, w, h, &mut out);
+    out
+}
