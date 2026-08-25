@@ -52,6 +52,7 @@ The first build will be slow (compiling wgpu, etc.) — a few minutes. Subsequen
 |---|---|
 | Copy (if there's a selection) / SIGINT (otherwise) | `Ctrl+C` |
 | Paste | `Ctrl+V` |
+| Delete previous word | `Ctrl+Backspace` |
 | Force copy (Alacritty-style fallback) | `Ctrl+Shift+C` |
 | Force paste | `Ctrl+Shift+V` |
 | New tab | `Ctrl+Shift+T` |

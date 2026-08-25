@@ -34,7 +34,7 @@ pub struct GpuState {
 }
 
 impl GpuState {
-    pub async fn new(window: Arc<Window>, font_size: f32) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, font_size: f32, vsync: bool) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             // DX12 first on Windows: lower driver overhead than the GL/Vulkan
@@ -77,7 +77,11 @@ impl GpuState {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoNoVsync, // lowest latency; Mailbox/Fifo via config later
+            present_mode: if vsync {
+                wgpu::PresentMode::AutoVsync
+            } else {
+                wgpu::PresentMode::AutoNoVsync
+            },
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 1, // minimize input-to-photon latency

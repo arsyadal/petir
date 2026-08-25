@@ -52,6 +52,7 @@ Build pertama akan lama (compile wgpu, dsb.) — beberapa menit. Build berikutny
 |---|---|
 | Copy (kalau ada seleksi) / SIGINT (kalau tidak) | `Ctrl+C` |
 | Paste | `Ctrl+V` |
+| Hapus kata sebelumnya | `Ctrl+Backspace` |
 | Copy paksa (fallback ala Alacritty) | `Ctrl+Shift+C` |
 | Paste paksa | `Ctrl+Shift+V` |
 | Tab baru | `Ctrl+Shift+T` |

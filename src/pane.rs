@@ -4,10 +4,11 @@
 //! Terminal / kitty / tmux.
 
 use crate::config::Config;
-use crate::pty::PtyHandle;
+use crate::pty::{PtyHandle, PtyWake};
 use crate::selection::Selection;
 use crate::term::Term;
 use anyhow::Result;
+use winit::event_loop::EventLoopProxy;
 
 pub struct Pane {
     pub term: Term,
@@ -18,8 +19,12 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn new(cols: u16, rows: u16, config: &Config) -> Result<Self> {
-        let pty = PtyHandle::spawn(cols, rows, &config.shell)?;
+    pub fn new(cols: u16, rows: u16, config: &Config, proxy: &EventLoopProxy<PtyWake>) -> Result<Self> {
+        let proxy = proxy.clone();
+        let wake = Box::new(move || {
+            let _ = proxy.send_event(PtyWake);
+        });
+        let pty = PtyHandle::spawn(cols, rows, &config.shell, wake)?;
         let term = Term::new(cols as usize, rows as usize, config.scroll.history_lines);
         Ok(Self {
             term,
@@ -31,11 +36,15 @@ impl Pane {
     }
 
     /// Drain whatever the PTY has produced since the last frame and feed it
-    /// to the VT100 parser. Called once per frame from the render loop.
-    pub fn pump(&mut self) {
+    /// to the VT100 parser. Returns whether anything arrived, which the
+    /// render loop uses to decide if a new frame is needed at all.
+    pub fn pump(&mut self) -> bool {
+        let mut got_output = false;
         while let Ok(bytes) = self.pty.output_rx.try_recv() {
             self.term.advance(&bytes);
+            got_output = true;
         }
+        got_output
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -116,8 +125,8 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(cols: u16, rows: u16, config: &Config) -> Result<Self> {
-        let pane = Pane::new(cols, rows, config)?;
+    pub fn new(cols: u16, rows: u16, config: &Config, proxy: &EventLoopProxy<PtyWake>) -> Result<Self> {
+        let pane = Pane::new(cols, rows, config, proxy)?;
         Ok(Self {
             title: "rterm".to_string(),
             panes: vec![pane],
@@ -129,12 +138,19 @@ impl Tab {
     /// Split the currently active pane. `total_{cols,rows}` is the full tab
     /// viewport in cells, used to size the freshly created pane before the
     /// next real resize event arrives.
-    pub fn split_active(&mut self, dir: SplitDir, config: &Config, cols: u16, rows: u16) -> Result<()> {
+    pub fn split_active(
+        &mut self,
+        dir: SplitDir,
+        config: &Config,
+        cols: u16,
+        rows: u16,
+        proxy: &EventLoopProxy<PtyWake>,
+    ) -> Result<()> {
         let (new_cols, new_rows) = match dir {
             SplitDir::Horizontal => (cols / 2, rows),
             SplitDir::Vertical => (cols, rows / 2),
         };
-        let pane = Pane::new(new_cols.max(1), new_rows.max(1), config)?;
+        let pane = Pane::new(new_cols.max(1), new_rows.max(1), config, proxy)?;
         let new_idx = self.panes.len();
         self.panes.push(pane);
         self.layout.replace_leaf(self.active_pane, new_idx, dir);
@@ -162,15 +178,21 @@ pub struct TabBar {
 }
 
 impl TabBar {
-    pub fn new(cols: u16, rows: u16, config: &Config) -> Result<Self> {
+    pub fn new(cols: u16, rows: u16, config: &Config, proxy: &EventLoopProxy<PtyWake>) -> Result<Self> {
         Ok(Self {
-            tabs: vec![Tab::new(cols, rows, config)?],
+            tabs: vec![Tab::new(cols, rows, config, proxy)?],
             active_tab: 0,
         })
     }
 
-    pub fn new_tab(&mut self, cols: u16, rows: u16, config: &Config) -> Result<()> {
-        self.tabs.push(Tab::new(cols, rows, config)?);
+    pub fn new_tab(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        config: &Config,
+        proxy: &EventLoopProxy<PtyWake>,
+    ) -> Result<()> {
+        self.tabs.push(Tab::new(cols, rows, config, proxy)?);
         self.active_tab = self.tabs.len() - 1;
         Ok(())
     }

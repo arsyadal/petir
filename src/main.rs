@@ -1,3 +1,8 @@
+// Windows: no extra console window on launch. `windows_subsystem` only takes
+// effect in release builds; debug builds keep the console so log output and
+// panics stay visible while developing.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod config;
 mod image;
 mod pane;
@@ -9,6 +14,7 @@ mod term;
 
 use config::Config;
 use pane::{SplitDir, TabBar};
+use pty::PtyWake;
 use renderer::GpuState;
 use search::SearchState;
 use selection::{ClipboardManager, GridPos, Selection};
@@ -17,7 +23,7 @@ use std::time::{Duration, Instant};
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::WindowBuilder,
 };
@@ -32,14 +38,24 @@ struct App {
     modifiers: ModifiersState,
     mouse_down: bool,
     last_frame: Instant,
+    /// Something changed since the last presented frame. The render loop is
+    /// idle-driven: with this false there is nothing new to draw, so no frame
+    /// is submitted at all. Without it the loop re-shapes and re-renders the
+    /// whole grid continuously and pegs a core even on an idle prompt.
+    dirty: bool,
+    /// Handed to every PTY we spawn so its reader thread can wake the loop.
+    proxy: EventLoopProxy<PtyWake>,
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let config = Config::load();
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let event_loop = EventLoopBuilder::<PtyWake>::with_user_event().build()?;
+    // Idle-driven: the loop sleeps until the OS delivers input or a PTY
+    // reader thread wakes it with a PtyWake. Nothing is polled on a timer.
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
 
     let window_icon = load_icon();
     let window = Arc::new(
@@ -50,12 +66,12 @@ fn main() -> anyhow::Result<()> {
             .build(&event_loop)?,
     );
 
-    let gpu = pollster::block_on(GpuState::new(window.clone(), config.font.size))?;
+    let gpu = pollster::block_on(GpuState::new(window.clone(), config.font.size, config.window.vsync))?;
     let (cols, rows) = gpu.cols_rows_for(
         gpu.size.width as f32 - config.window.padding_x as f32 * 2.0,
         gpu.size.height as f32 - config.window.padding_y as f32 * 2.0,
     );
-    let tabs = TabBar::new(cols, rows, &config)?;
+    let tabs = TabBar::new(cols, rows, &config, &proxy)?;
 
     let mut app = App {
         config,
@@ -67,6 +83,8 @@ fn main() -> anyhow::Result<()> {
         modifiers: ModifiersState::empty(),
         mouse_down: false,
         last_frame: Instant::now(),
+        dirty: true,
+        proxy: proxy.clone(),
     };
 
     let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
@@ -77,45 +95,61 @@ fn main() -> anyhow::Result<()> {
             WindowEvent::Resized(size) => {
                 app.gpu.resize(size);
                 app.resize_panes();
+                app.dirty = true;
             }
             WindowEvent::ModifiersChanged(mods) => app.modifiers = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_pos = position;
                 if app.mouse_down {
                     app.extend_selection(cursor_pos);
+                    app.dirty = true;
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    app.mouse_down = true;
-                    app.begin_selection(cursor_pos);
-                }
-                ElementState::Released => {
-                    app.mouse_down = false;
-                    if app.config.clipboard.copy_on_select {
-                        app.copy_current_selection();
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                match state {
+                    ElementState::Pressed => {
+                        app.mouse_down = true;
+                        app.begin_selection(cursor_pos);
+                    }
+                    ElementState::Released => {
+                        app.mouse_down = false;
+                        if app.config.clipboard.copy_on_select {
+                            app.copy_current_selection();
+                        }
                     }
                 }
-            },
-            WindowEvent::KeyboardInput { event, .. } => app.handle_key(event, elwt),
-            WindowEvent::RedrawRequested => {
-                app.frame();
-                window.request_redraw();
+                app.dirty = true;
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                app.handle_key(event, elwt);
+                app.dirty = true;
+            }
+            WindowEvent::RedrawRequested => app.frame(),
             _ => {}
         },
+        winit::event::Event::UserEvent(PtyWake) => {
+            if app.pump_ptys() {
+                app.dirty = true;
+            }
+        }
         winit::event::Event::AboutToWait => {
-            // Cap redraw rate if configured; otherwise request every loop
-            // iteration for the lowest possible input-to-photon latency.
-            let target = app.config.window.max_fps;
-            if target > 0 {
-                let frame_time = Duration::from_secs_f64(1.0 / target as f64);
-                if app.last_frame.elapsed() >= frame_time {
-                    app.last_frame = Instant::now();
-                    window.request_redraw();
-                }
-            } else {
+            if !app.dirty {
+                return;
+            }
+            // Rate-limit presentation: a burst of output (a build log, `cat`
+            // of a big file) wakes us far more often than the display can
+            // show, so coalesce those into at most one frame per slot and
+            // sleep out the remainder.
+            let frame_time = app.frame_time();
+            let since = app.last_frame.elapsed();
+            if since >= frame_time {
+                app.last_frame = Instant::now();
                 window.request_redraw();
+                // Back to sleeping indefinitely; a stale WaitUntil deadline
+                // left over from the branch below would busy-loop.
+                elwt.set_control_flow(ControlFlow::Wait);
+            } else {
+                elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + (frame_time - since)));
             }
         }
         _ => {}
@@ -139,11 +173,32 @@ impl App {
         }
     }
 
-    fn frame(&mut self) {
-        let tab = self.tabs.active_tab_mut();
-        for pane in tab.panes.iter_mut() {
-            pane.pump();
+    /// Minimum time between presented frames, from `window.max_fps`
+    /// (0 = uncapped, bounded here to a 1000 Hz poll so the loop still sleeps).
+    fn frame_time(&self) -> Duration {
+        let target = self.config.window.max_fps;
+        if target > 0 {
+            Duration::from_secs_f64(1.0 / target as f64)
+        } else {
+            Duration::from_millis(1)
         }
+    }
+
+    /// Drain PTY output for every pane of the active tab into its parser.
+    /// Returns whether any bytes arrived, i.e. whether the screen changed.
+    fn pump_ptys(&mut self) -> bool {
+        let mut changed = false;
+        for pane in self.tabs.active_tab_mut().panes.iter_mut() {
+            if pane.pump() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn frame(&mut self) {
+        self.dirty = false;
+        let tab = self.tabs.active_tab_mut();
 
         let pad = (self.config.window.padding_x as f32, self.config.window.padding_y as f32);
         let w = self.gpu.size.width as f32 - pad.0 * 2.0;
@@ -196,7 +251,7 @@ impl App {
         let _ = selection::smart_copy(&pane.selection, &pane.term.grid, &mut self.clipboard);
     }
 
-    fn handle_key(&mut self, event: KeyEvent, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+    fn handle_key(&mut self, event: KeyEvent, elwt: &winit::event_loop::EventLoopWindowTarget<PtyWake>) {
         if event.state != ElementState::Pressed {
             return;
         }
@@ -208,7 +263,7 @@ impl App {
             match &event.logical_key {
                 Key::Character(s) if s.as_str() == "T" || s.as_str() == "t" => {
                     let (cols, rows) = self.current_cols_rows();
-                    let _ = self.tabs.new_tab(cols, rows, &self.config);
+                    let _ = self.tabs.new_tab(cols, rows, &self.config, &self.proxy);
                     return;
                 }
                 Key::Character(s) if s.as_str() == "W" || s.as_str() == "w" => {
@@ -218,14 +273,14 @@ impl App {
                 Key::Character(s) if s.as_str() == "E" || s.as_str() == "e" => {
                     let (cols, rows) = self.current_cols_rows();
                     let tab = self.tabs.active_tab_mut();
-                    let _ = tab.split_active(SplitDir::Horizontal, &self.config, cols, rows);
+                    let _ = tab.split_active(SplitDir::Horizontal, &self.config, cols, rows, &self.proxy);
                     self.resize_panes();
                     return;
                 }
                 Key::Character(s) if s.as_str() == "D" || s.as_str() == "d" => {
                     let (cols, rows) = self.current_cols_rows();
                     let tab = self.tabs.active_tab_mut();
-                    let _ = tab.split_active(SplitDir::Vertical, &self.config, cols, rows);
+                    let _ = tab.split_active(SplitDir::Vertical, &self.config, cols, rows, &self.proxy);
                     self.resize_panes();
                     return;
                 }
@@ -280,16 +335,21 @@ impl App {
                     self.tabs.active_tab_mut().focus_next_pane();
                     return;
                 }
+                Key::Named(NamedKey::Backspace) => {
+                    // Delete the previous word. 0x08 is what Windows Terminal
+                    // sends for Ctrl+Backspace, so PSReadLine maps it to
+                    // BackwardDeleteWord; readline shells treat it the same
+                    // way once they see it as Ctrl+H.
+                    self.send_bytes(&[0x08]);
+                    return;
+                }
                 _ => {}
             }
         }
 
-        if event.logical_key == Key::Named(NamedKey::Escape) {
-            elwt.set_control_flow(ControlFlow::Poll); // no-op, keeps app responsive
-            if self.search_active {
-                self.search_active = false;
-                return;
-            }
+        if event.logical_key == Key::Named(NamedKey::Escape) && self.search_active {
+            self.search_active = false;
+            return;
         }
 
         // --- Search box input (consumes keys instead of forwarding to the

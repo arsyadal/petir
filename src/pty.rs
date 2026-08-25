@@ -9,6 +9,11 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// Sent to the event loop when a PTY produces output, so the loop can sleep
+/// in `ControlFlow::Wait` instead of polling the output channel on a timer.
+#[derive(Debug, Clone, Copy)]
+pub struct PtyWake;
+
 pub struct PtyHandle {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -46,7 +51,9 @@ fn which_windows(exe: &str) -> bool {
 }
 
 impl PtyHandle {
-    pub fn spawn(cols: u16, rows: u16, shell: &str) -> Result<Self> {
+    /// `wake` is called from the reader thread whenever new output lands, so
+    /// the UI thread can stay blocked until there is actually something to do.
+    pub fn spawn(cols: u16, rows: u16, shell: &str, wake: Box<dyn Fn() + Send>) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -87,6 +94,7 @@ impl PtyHandle {
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
+                            wake();
                         }
                         Err(_) => break,
                     }

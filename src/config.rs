@@ -33,6 +33,9 @@ pub struct WindowConfig {
     pub decorations: bool,
     /// Cap FPS to save battery/CPU on laptops. 0 = uncapped (present as fast as GPU allows).
     pub max_fps: u32,
+    /// Wait for vertical blank before presenting. Off trades visible tearing
+    /// for a little less input-to-photon latency.
+    pub vsync: bool,
 }
 
 impl Default for WindowConfig {
@@ -42,7 +45,8 @@ impl Default for WindowConfig {
             padding_y: 6,
             opacity: 1.0,
             decorations: true,
-            max_fps: 0,
+            max_fps: 144,
+            vsync: true,
         }
     }
 }
@@ -153,7 +157,8 @@ padding_x = 6
 padding_y = 6
 opacity = 1.0
 decorations = true
-max_fps = 0 # 0 = uncapped
+max_fps = 144 # 0 = uncapped
+# vsync = true  # false: latency terendah, tapi bisa tearing
 
 [clipboard]
 # Ctrl+C copy kalau ada seleksi, Ctrl+V paste langsung -- tanpa Ctrl+Shift.
