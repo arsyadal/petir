@@ -63,6 +63,8 @@ The first build will be slow (compiling wgpu, etc.) — a few minutes. Subsequen
 | Clear screen | `Ctrl+L` |
 | Toggle search (no overlay UI yet) | `Ctrl+Shift+F` |
 
+Right-click anywhere in the terminal for a context menu with these same actions, each showing its shortcut.
+
 Everything can be changed via `%APPDATA%\petir\petir.toml` (created automatically on first run) — except keybindings, which are currently hardcoded in `src/main.rs::handle_key` (configurable keybindings is a natural follow-up).
 
 ## Benchmark vs Alacritty

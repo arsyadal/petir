@@ -16,13 +16,26 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    /// Linear-light components for the GPU. The surface is an sRGB format,
+    /// which means the value a fragment shader writes is treated as linear
+    /// and re-encoded to sRGB on store — so handing it the raw sRGB byte
+    /// washes every color out (a 0x1e background renders as mid grey).
     pub fn to_wgpu(self) -> [f32; 4] {
         [
-            self.r as f32 / 255.0,
-            self.g as f32 / 255.0,
-            self.b as f32 / 255.0,
+            srgb_to_linear(self.r),
+            srgb_to_linear(self.g),
+            srgb_to_linear(self.b),
             1.0,
         ]
+    }
+}
+
+pub fn srgb_to_linear(c: u8) -> f32 {
+    let c = c as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 

@@ -192,6 +192,81 @@ impl Grid {
         }
     }
 
+    /// DCH: delete `n` cells at the cursor, pulling the rest of the line
+    /// left and blanking the tail. Shells lean on this when redrawing an
+    /// edited prompt; without it the old, longer text stays on screen.
+    pub fn delete_chars(&mut self, n: usize) {
+        let (col, cols) = (self.cursor.col, self.cols);
+        if let Some(line) = self.visible.get_mut(self.cursor.row) {
+            let n = n.min(cols.saturating_sub(col));
+            if n == 0 {
+                return;
+            }
+            line.copy_within(col + n.., col);
+            for cell in line[cols - n..].iter_mut() {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    /// ICH: insert `n` blanks at the cursor, pushing the rest of the line
+    /// right; cells shifted past the last column are dropped.
+    pub fn insert_chars(&mut self, n: usize) {
+        let (col, cols) = (self.cursor.col, self.cols);
+        if let Some(line) = self.visible.get_mut(self.cursor.row) {
+            let n = n.min(cols.saturating_sub(col));
+            if n == 0 {
+                return;
+            }
+            line.copy_within(col..cols - n, col + n);
+            for cell in line[col..col + n].iter_mut() {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    /// ECH: blank `n` cells from the cursor without moving anything.
+    pub fn erase_chars(&mut self, n: usize) {
+        let (col, cols) = (self.cursor.col, self.cols);
+        if let Some(line) = self.visible.get_mut(self.cursor.row) {
+            for cell in line.iter_mut().skip(col).take(n.min(cols - col)) {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    /// IL: open `n` blank lines at the cursor row, pushing lower lines down
+    /// and off the bottom of the screen.
+    pub fn insert_lines(&mut self, n: usize) {
+        let (row, rows, cols) = (self.cursor.row, self.rows, self.cols);
+        let n = n.min(rows.saturating_sub(row));
+        for _ in 0..n {
+            self.visible.pop_back();
+            self.visible.insert(row, vec![Cell::default(); cols]);
+        }
+    }
+
+    /// DL: remove `n` lines at the cursor row, pulling lower lines up and
+    /// adding blank lines at the bottom.
+    pub fn delete_lines(&mut self, n: usize) {
+        let (row, rows, cols) = (self.cursor.row, self.rows, self.cols);
+        let n = n.min(rows.saturating_sub(row));
+        for _ in 0..n {
+            self.visible.remove(row);
+            self.visible.push_back(vec![Cell::default(); cols]);
+        }
+    }
+
+    /// RI: move up one line, scrolling the screen down when already at the top.
+    pub fn reverse_index(&mut self) {
+        if self.cursor.row == 0 {
+            self.visible.pop_back();
+            self.visible.push_front(vec![Cell::default(); self.cols]);
+        } else {
+            self.cursor.row -= 1;
+        }
+    }
+
     /// Text of a visible row, used by search & selection copy.
     pub fn row_text(&self, row: usize) -> String {
         self.visible

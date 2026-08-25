@@ -5,6 +5,7 @@
 
 mod config;
 mod image;
+mod menu;
 mod pane;
 mod pty;
 mod renderer;
@@ -13,6 +14,7 @@ mod selection;
 mod term;
 
 use config::Config;
+use menu::{ContextMenu, MenuAction};
 use pane::{SplitDir, TabBar};
 use pty::PtyWake;
 use renderer::GpuState;
@@ -45,6 +47,7 @@ struct App {
     dirty: bool,
     /// Handed to every PTY we spawn so its reader thread can wake the loop.
     proxy: EventLoopProxy<PtyWake>,
+    menu: Option<ContextMenu>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -85,6 +88,7 @@ fn main() -> anyhow::Result<()> {
         last_frame: Instant::now(),
         dirty: true,
         proxy: proxy.clone(),
+        menu: None,
     };
 
     let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
@@ -100,21 +104,51 @@ fn main() -> anyhow::Result<()> {
             WindowEvent::ModifiersChanged(mods) => app.modifiers = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_pos = position;
-                if app.mouse_down {
+                if let Some(m) = app.menu.as_mut() {
+                    let hovered = m.hit(position.x as f32, position.y as f32);
+                    if hovered != m.hovered {
+                        m.hovered = hovered;
+                        app.dirty = true;
+                    }
+                } else if app.mouse_down {
                     app.extend_selection(cursor_pos);
+                    app.dirty = true;
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
+                if state == ElementState::Pressed {
+                    app.menu = Some(ContextMenu::new(
+                        cursor_pos.x as f32,
+                        cursor_pos.y as f32,
+                        app.gpu.size.width as f32,
+                        app.gpu.size.height as f32,
+                    ));
                     app.dirty = true;
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 match state {
                     ElementState::Pressed => {
-                        app.mouse_down = true;
-                        app.begin_selection(cursor_pos);
+                        // A click anywhere dismisses the menu; a click on a
+                        // row runs it. Either way it must not also start a
+                        // text selection underneath the menu.
+                        if let Some(m) = app.menu.take() {
+                            if let Some(idx) = m.hit(cursor_pos.x as f32, cursor_pos.y as f32) {
+                                if let Some(action) = m.items[idx].action {
+                                    app.run_menu_action(action);
+                                }
+                            }
+                        } else {
+                            app.mouse_down = true;
+                            app.begin_selection(cursor_pos);
+                        }
                     }
                     ElementState::Released => {
-                        app.mouse_down = false;
-                        if app.config.clipboard.copy_on_select {
-                            app.copy_current_selection();
+                        if app.mouse_down {
+                            app.mouse_down = false;
+                            if app.config.clipboard.copy_on_select {
+                                app.copy_current_selection();
+                            }
                         }
                     }
                 }
@@ -217,10 +251,13 @@ impl App {
             None
         };
 
-        if let Err(e) = self
-            .gpu
-            .render_frame(&panes, pad, self.config.font.ligatures, search_overlay)
-        {
+        if let Err(e) = self.gpu.render_frame(
+            &panes,
+            pad,
+            self.config.font.ligatures,
+            search_overlay,
+            self.menu.as_ref(),
+        ) {
             log::warn!("render error: {e}");
         }
     }
@@ -347,9 +384,14 @@ impl App {
             }
         }
 
-        if event.logical_key == Key::Named(NamedKey::Escape) && self.search_active {
-            self.search_active = false;
-            return;
+        if event.logical_key == Key::Named(NamedKey::Escape) {
+            if self.menu.take().is_some() {
+                return;
+            }
+            if self.search_active {
+                self.search_active = false;
+                return;
+            }
         }
 
         // --- Search box input (consumes keys instead of forwarding to the
@@ -400,6 +442,40 @@ impl App {
     fn send_bytes(&mut self, bytes: &[u8]) {
         let pane = self.tabs.active_tab_mut().active_pane_mut();
         let _ = pane.pty.write_input(bytes);
+    }
+
+    /// Run a context-menu entry. Each one routes to the same code path as
+    /// its keyboard shortcut, so the two can't drift apart in behavior.
+    fn run_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::Copy => self.copy_current_selection(),
+            MenuAction::Paste => self.paste_clipboard(),
+            MenuAction::SplitHorizontal | MenuAction::SplitVertical => {
+                let dir = if action == MenuAction::SplitHorizontal {
+                    SplitDir::Horizontal
+                } else {
+                    SplitDir::Vertical
+                };
+                let (cols, rows) = self.current_cols_rows();
+                let tab = self.tabs.active_tab_mut();
+                let _ = tab.split_active(dir, &self.config, cols, rows, &self.proxy);
+                self.resize_panes();
+            }
+            MenuAction::NewTab => {
+                let (cols, rows) = self.current_cols_rows();
+                let _ = self.tabs.new_tab(cols, rows, &self.config, &self.proxy);
+            }
+            MenuAction::CloseTab => self.tabs.close_active_tab(),
+            MenuAction::Search => {
+                self.search_active = !self.search_active;
+                if self.search_active {
+                    self.rerun_search();
+                }
+            }
+            MenuAction::Clear => {
+                self.tabs.active_tab_mut().active_pane_mut().term.grid.erase_in_display(2);
+            }
+        }
     }
 
     /// Re-run scrollback search against the active pane's grid, e.g. after

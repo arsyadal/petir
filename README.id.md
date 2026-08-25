@@ -63,6 +63,8 @@ Build pertama akan lama (compile wgpu, dsb.) — beberapa menit. Build berikutny
 | Clear screen | `Ctrl+L` |
 | Toggle search (belum ada UI overlay) | `Ctrl+Shift+F` |
 
+Klik kanan di area terminal memunculkan context menu berisi aksi yang sama, lengkap dengan shortcut-nya.
+
 Semua bisa diubah lewat `%APPDATA%\petir\petir.toml` (dibuat otomatis saat pertama kali run) — kecuali keybinding, yang untuk sekarang masih hardcoded di `src/main.rs::handle_key` (config-able keybinding adalah follow-up alami).
 
 ## Benchmark vs Alacritty

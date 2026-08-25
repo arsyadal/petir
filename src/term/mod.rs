@@ -46,6 +46,9 @@ pub struct Term {
     pub images: Vec<DecodedImage>,
     dcs_kind: Option<DcsKind>,
     dcs_buf: Vec<u8>,
+    /// Cursor stashed by DECSC (ESC 7) / SCP (CSI s), restored by their
+    /// counterparts. Shells use this around prompt redraws.
+    saved_cursor: Option<grid::CursorPos>,
 }
 
 impl Term {
@@ -62,6 +65,7 @@ impl Term {
             images: Vec::new(),
             dcs_kind: None,
             dcs_buf: Vec::new(),
+            saved_cursor: None,
         }
     }
 
@@ -147,7 +151,7 @@ impl<'a> Perform for TermPerformer<'a> {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, c: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
         let p = |i: usize, default: u16| -> u16 {
             params
                 .iter()
@@ -174,9 +178,58 @@ impl<'a> Perform for TermPerformer<'a> {
                 self.term.grid.cursor.row = row.min(self.term.grid.rows.saturating_sub(1));
                 self.term.grid.cursor.col = col.min(self.term.grid.cols.saturating_sub(1));
             }
+            'G' => {
+                let col = p(0, 1).saturating_sub(1) as usize;
+                self.term.grid.cursor.col = col.min(self.term.grid.cols.saturating_sub(1));
+            }
+            'd' => {
+                let row = p(0, 1).saturating_sub(1) as usize;
+                self.term.grid.cursor.row = row.min(self.term.grid.rows.saturating_sub(1));
+            }
+            'E' => {
+                self.term.grid.cursor.col = 0;
+                self.term.grid.cursor.row =
+                    (self.term.grid.cursor.row + p(0, 1) as usize).min(self.term.grid.rows - 1);
+            }
+            'F' => {
+                self.term.grid.cursor.col = 0;
+                self.term.grid.cursor.row = self.term.grid.cursor.row.saturating_sub(p(0, 1) as usize);
+            }
             'J' => self.term.grid.erase_in_display(p(0, 0)),
             'K' => self.term.grid.erase_in_line(p(0, 0)),
+            '@' => self.term.grid.insert_chars(p(0, 1) as usize),
+            'P' => self.term.grid.delete_chars(p(0, 1) as usize),
+            'X' => self.term.grid.erase_chars(p(0, 1) as usize),
+            'L' => self.term.grid.insert_lines(p(0, 1) as usize),
+            'M' => self.term.grid.delete_lines(p(0, 1) as usize),
+            's' => self.term.saved_cursor = Some(self.term.grid.cursor),
+            'u' => {
+                if let Some(pos) = self.term.saved_cursor {
+                    self.term.grid.cursor = pos;
+                }
+            }
+            // DECSET/DECRST. Only DECTCEM (?25, cursor visibility) is acted
+            // on; the rest are accepted and ignored so they don't fall
+            // through and print as garbage.
+            'h' | 'l' if intermediates.first() == Some(&b'?') => {
+                if p(0, 0) == 25 {
+                    self.term.grid.cursor_visible = c == 'h';
+                }
+            }
             'm' => self.sgr(params),
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'M' => self.term.grid.reverse_index(), // RI
+            b'7' => self.term.saved_cursor = Some(self.term.grid.cursor),
+            b'8' => {
+                if let Some(pos) = self.term.saved_cursor {
+                    self.term.grid.cursor = pos;
+                }
+            }
             _ => {}
         }
     }

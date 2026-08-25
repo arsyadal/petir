@@ -1,8 +1,9 @@
 pub mod quad;
 
+use crate::menu::ContextMenu;
 use crate::pane::Layout;
 use crate::search::SearchState;
-use crate::term::cell::CellFlags;
+use crate::term::cell::{srgb_to_linear, CellFlags};
 use crate::term::grid::Grid;
 use glyphon::{
     Attrs, Buffer as TextBuffer, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution,
@@ -152,6 +153,7 @@ impl GpuState {
         padding: (f32, f32),
         ligatures: bool,
         search: Option<(&SearchState, usize)>,
+        menu: Option<&ContextMenu>,
     ) -> anyhow::Result<()> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -180,6 +182,9 @@ impl GpuState {
             None
         };
 
+        // --- Context menu chrome, drawn last so it sits above the grid ---
+        let menu_text = menu.map(|m| self.push_menu_instances(m, &mut instances));
+
         // --- Text buffers, one per pane, built fresh each frame ---
         let shaping = if ligatures { Shaping::Advanced } else { Shaping::Basic };
         let mut buffers: Vec<TextBuffer> = Vec::with_capacity(panes.len() + 1);
@@ -191,12 +196,30 @@ impl GpuState {
             buf.shape_until_scroll(&mut self.font_system);
             buffers.push(buf);
         }
+        let mut search_buf_idx = None;
         if let Some((_, _, label)) = &search_box {
             let mut buf = TextBuffer::new(&mut self.font_system, Metrics::new(self.font_size, self.cell_h));
             buf.set_size(&mut self.font_system, SEARCH_BOX_W, SEARCH_BOX_H);
             buf.set_text(&mut self.font_system, label, Attrs::new().family(Family::Monospace), Shaping::Basic);
             buf.shape_until_scroll(&mut self.font_system);
+            search_buf_idx = Some(buffers.len());
             buffers.push(buf);
+        }
+        // One buffer per menu row: rows have different heights (items vs
+        // separators), so a single multi-line buffer would drift out of
+        // alignment with the highlight quads.
+        let menu_buffers_start = buffers.len();
+        if let Some(rows) = &menu_text {
+            for (_, text) in rows {
+                let mut buf = TextBuffer::new(
+                    &mut self.font_system,
+                    Metrics::new(self.font_size, ContextMenu::ITEM_H),
+                );
+                buf.set_size(&mut self.font_system, ContextMenu::WIDTH, ContextMenu::ITEM_H);
+                buf.set_text(&mut self.font_system, text, Attrs::new().family(Family::Monospace), Shaping::Basic);
+                buf.shape_until_scroll(&mut self.font_system);
+                buffers.push(buf);
+            }
         }
 
         let mut text_areas: Vec<TextArea> = panes
@@ -216,9 +239,10 @@ impl GpuState {
                 default_color: GlyphonColor::rgb(0xd8, 0xd8, 0xd8),
             })
             .collect();
-        if let Some((x, y, _)) = search_box {
+        if let (Some((x, y, _)), Some(idx)) = (&search_box, search_buf_idx) {
+            let (x, y) = (*x, *y);
             text_areas.push(TextArea {
-                buffer: buffers.last().unwrap(),
+                buffer: &buffers[idx],
                 left: x + 8.0,
                 top: y + 6.0,
                 scale: 1.0,
@@ -230,6 +254,27 @@ impl GpuState {
                 },
                 default_color: GlyphonColor::rgb(0xff, 0xff, 0xff),
             });
+        }
+
+        if let (Some(m), Some(rows)) = (menu, &menu_text) {
+            let offsets = m.row_offsets();
+            let menu_bottom = (m.y + m.height()) as i32;
+            for (buf_i, (item_idx, _)) in rows.iter().enumerate() {
+                let top = m.y + offsets[*item_idx];
+                text_areas.push(TextArea {
+                    buffer: &buffers[menu_buffers_start + buf_i],
+                    left: m.x + ContextMenu::PAD,
+                    top: top + (ContextMenu::ITEM_H - self.cell_h) * 0.5,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: m.x as i32,
+                        top: m.y as i32,
+                        right: (m.x + ContextMenu::WIDTH) as i32,
+                        bottom: menu_bottom,
+                    },
+                    default_color: GlyphonColor::rgb(0xe8, 0xe8, 0xe8),
+                });
+            }
         }
 
         let resolution = Resolution { width: self.config.width, height: self.config.height };
@@ -250,7 +295,12 @@ impl GpuState {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.117, g: 0.117, b: 0.117, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: srgb_to_linear(0x1e) as f64,
+                            g: srgb_to_linear(0x1e) as f64,
+                            b: srgb_to_linear(0x1e) as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -322,9 +372,11 @@ impl GpuState {
             }
             let visible_row = m.row - scrollback_len;
             let color = if i == state.current {
-                [1.0, 0.55, 0.0, 0.55] // current match: brighter orange
+                // current match: brighter orange
+                [srgb_to_linear(0xff), srgb_to_linear(0x8c), 0.0, 0.55]
             } else {
-                [1.0, 0.85, 0.2, 0.35] // other matches: dim yellow
+                // other matches: dim yellow
+                [srgb_to_linear(0xff), srgb_to_linear(0xd9), srgb_to_linear(0x33), 0.35]
             };
             let width = m.col_end.saturating_sub(m.col_start).max(1) as f32 * self.cell_w;
             out.push(QuadInstance {
@@ -347,12 +399,12 @@ impl GpuState {
         out.push(QuadInstance {
             pos: [x - 1.5, y - 1.5],
             size: [SEARCH_BOX_W + 3.0, SEARCH_BOX_H + 3.0],
-            color: [1.0, 0.55, 0.0, 0.9],
+            color: [srgb_to_linear(0xff), srgb_to_linear(0x8c), 0.0, 0.9],
         });
         out.push(QuadInstance {
             pos: [x, y],
             size: [SEARCH_BOX_W, SEARCH_BOX_H],
-            color: [0.08, 0.08, 0.08, 0.95],
+            color: [srgb_to_linear(0x14), srgb_to_linear(0x14), srgb_to_linear(0x14), 0.95],
         });
         let label = if state.query.is_empty() {
             "Search: (type to search)".to_string()
@@ -362,6 +414,56 @@ impl GpuState {
             format!("Search: {}  {}/{}", state.query, state.current + 1, state.matches.len())
         };
         (x, y, label)
+    }
+
+    /// Panel, hover highlight and separator hairlines for the context menu.
+    /// Returns `(item_index, line_text)` for each selectable row, with the
+    /// shortcut space-padded to sit flush against the right edge — the font
+    /// is monospace, so column math is enough to right-align it.
+    fn push_menu_instances(&self, m: &ContextMenu, out: &mut Vec<QuadInstance>) -> Vec<(usize, String)> {
+        let h = m.height();
+
+        // Border, then panel inset by 1px so the border reads as a hairline.
+        out.push(QuadInstance {
+            pos: [m.x - 1.0, m.y - 1.0],
+            size: [ContextMenu::WIDTH + 2.0, h + 2.0],
+            color: [srgb_to_linear(0x4a), srgb_to_linear(0x4a), srgb_to_linear(0x4a), 1.0],
+        });
+        out.push(QuadInstance {
+            pos: [m.x, m.y],
+            size: [ContextMenu::WIDTH, h],
+            color: [srgb_to_linear(0x24), srgb_to_linear(0x24), srgb_to_linear(0x24), 1.0],
+        });
+
+        let offsets = m.row_offsets();
+        let inner_w = ContextMenu::WIDTH - ContextMenu::PAD * 2.0;
+        let cols = (inner_w / self.cell_w).floor().max(1.0) as usize;
+
+        let mut rows = Vec::new();
+        for (idx, item) in m.items.iter().enumerate() {
+            let top = m.y + offsets[idx];
+            if item.action.is_none() {
+                out.push(QuadInstance {
+                    pos: [m.x + ContextMenu::PAD, top + ContextMenu::SEPARATOR_H * 0.5],
+                    size: [inner_w, 1.0],
+                    color: [srgb_to_linear(0x40), srgb_to_linear(0x40), srgb_to_linear(0x40), 1.0],
+                });
+                continue;
+            }
+
+            if m.hovered == Some(idx) {
+                out.push(QuadInstance {
+                    pos: [m.x, top],
+                    size: [ContextMenu::WIDTH, ContextMenu::ITEM_H],
+                    color: [srgb_to_linear(0xff), srgb_to_linear(0x8c), 0.0, 0.28],
+                });
+            }
+
+            let used = item.label.chars().count() + item.shortcut.chars().count();
+            let gap = cols.saturating_sub(used).max(1);
+            rows.push((idx, format!("{}{}{}", item.label, " ".repeat(gap), item.shortcut)));
+        }
+        rows
     }
 
     fn push_cursor_instance(&self, grid: &Grid, rect: [f32; 4], padding: (f32, f32), out: &mut Vec<QuadInstance>) {
